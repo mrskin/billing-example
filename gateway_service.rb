@@ -11,7 +11,7 @@ module ActiveMerchant
         READ_TIMEOUT = 90
         PROTOCOL = "https"
         PORTNO = "443"
-        VERSION = "R3.5"
+        VERSION = "R3.5M"
         USER_AGENT = "RG Client - Ruby #{VERSION}"
         REQUEST_HEADERS = {
           'Content-Type' => 'text/xml',
@@ -141,21 +141,22 @@ module ActiveMerchant
         def perform_transaction(request)
           server_names = get_server_names.shuffle
           request.clear_failed_server
+          response = ErrorResponse.new('No hosts specified', 301)
 
           server_names.each do |server|
-            @response = send_transaction(server, request)
+            response = send_transaction(server, request)
 
-            if @response.successful? || @response.unrecoverable?
-              return @response
+            if response.successful? || response.unrecoverable?
+              return response
             end
 
             request.failedServer = server
-            request.failedReasonCode = @response.reasonCode
-            request.failedResponseCode = @response.responseCode
-            request.failedGUID = @response.guidNo
+            request.failedReasonCode = response.reasonCode
+            request.failedResponseCode = response.responseCode
+            request.failedGUID = response.guidNo
           end
 
-          return @response
+          return response
         end
 
         def perform_targeted_transaction(request)
@@ -225,4 +226,3 @@ module ActiveMerchant
     end
   end
 end
-
