@@ -11,18 +11,24 @@ module ActiveMerchant
         READ_TIMEOUT = 90
         PROTOCOL = "https"
         PORTNO = "443"
-        VERSION = "R3.0"
+        VERSION = "R3.5M"
         USER_AGENT = "RG Client - Ruby #{VERSION}"
         REQUEST_HEADERS = {
           'Content-Type' => 'text/xml',
           'User-Agent' => USER_AGENT
         }
 
-        LIVE_HOST = 'secure.rocketgate.com'
-        TEST_HOST = 'dev-secure.rocketgate.com'
+        LIVE_HOSTS = ['gateway-16.rocketgate.com', 'gateway-17.rocketgate.com']
+        LIVE_HOST_16, LIVE_HOST_17 = LIVE_HOSTS
+
+        LIVE_HOST_IPS = ['69.20.127.91', '72.32.126.131']
+        LIVE_HOST_16_IP, LIVE_HOST_17_IP = LIVE_HOST_IPS
+
+        TEST_HOST = 'dev-gateway.rocketgate.com'
+        LIVE_HOST = 'gateway.rocketgate.com'
 
         attr_accessor :test_mode,
-                      :host, :servlet, :protocol, :port_number,
+                      :host, :hosts, :dns, :servlet, :protocol, :port_number,
                       :connect_timeout, :read_timeout
 
         def initialize(test)
@@ -37,10 +43,12 @@ module ActiveMerchant
         def test_mode=(test)
           if test
             @test_mode = true
-            self.host = TEST_HOST
+            self.hosts = [TEST_HOST]
+            self.dns = TEST_HOST
           else
             @test_mode = false
-            self.host = LIVE_HOST
+            self.hosts = LIVE_HOSTS
+            self.dns = LIVE_HOST
           end
         end
 
@@ -64,17 +72,18 @@ module ActiveMerchant
 
         def perform_ticket(request)
           request.transaction_type = :ticket
-          perform_transaction(request)
+          perform_targeted_transaction(request)
         end
 
         def perform_credit(request)
           request.transaction_type = :credit
-          perform_transaction(request)
+
+          request.reference_guid.nil? ? perform_transaction(request) : perform_targeted_transaction(request)
         end
 
         def perform_void(request)
           request.transaction_type = :void
-          perform_transaction(request)
+          perform_targeted_transaction(request)
         end
 
       private
@@ -87,10 +96,10 @@ module ActiveMerchant
           return response
         end
 
-        def send_transaction(request)
+        def send_transaction(server_name, request)
           request_xml = request.to_xml
 
-          connection = Net::HTTP.new(host, port_number)
+          connection = Net::HTTP.new(server_name, port_number)
           connection.open_timeout = connect_timeout
           connection.read_timeout = read_timeout
 
@@ -112,7 +121,7 @@ module ActiveMerchant
           body = response.body
 
           ::Rails.logger.warn { Base64.encode64(body).to_s }
-          Sentry.set_context("#{self.class.name}.send_transaction", body:Base64.encode64(body).to_s)
+          Sentry.set_context("#{self.class.name}.send_transaction", body: Base64.encode64(body).to_s)
 
           data = nil
 
@@ -130,22 +139,58 @@ module ActiveMerchant
         end
 
         def perform_transaction(request)
+          server_names = get_server_names.shuffle
           request.clear_failed_server
+          response = ErrorResponse.new('No hosts specified', 301)
 
-          response = send_transaction(request)
+          server_names.each do |server|
+            response = send_transaction(server, request)
 
-          if response.successful?
-            return response
-          elsif response.unrecoverable?
-            return response
+            if response.successful? || response.unrecoverable?
+              return response
+            end
+
+            request.failedServer = server
+            request.failedReasonCode = response.reasonCode
+            request.failedResponseCode = response.responseCode
+            request.failedGUID = response.guidNo
           end
 
-          request.failedServer = host
-          request.failedReasonCode = response.reasonCode
-          request.failedResponseCode = response.responseCode
-          request.failedGUID = response.guidNo
-
           return response
+        end
+
+        def perform_targeted_transaction(request)
+          request.clear_failed_server
+          reference_guid = request.reference_guid
+          if reference_guid.nil?
+            return ErrorResponse.new('No reference GUID specified for targeted transaction', 410)
+          end
+
+          site_string = '0x'
+          if (reference_guid.length > 15)
+            site_string << reference_guid[0, 2]
+          else
+            site_string << reference_guid[0, 1]
+          end
+
+          begin
+            site_number = Integer(site_string)
+          rescue => ex
+            return ErrorResponse.new("Unable to convert reference GUID (#{reference_guid} into site number (#{site_string} to integer): #{ex.message}", 410)
+          end
+
+          server_name = dns
+          separator = server_name.index('.')
+          if (separator.present? && separator > 0)
+            generated_server_name = ''
+            generated_server_name << server_name[0, separator]
+            generated_server_name << '-'
+            generated_server_name << site_number.to_s
+            generated_server_name << server_name[separator, server_name.length]
+            server_name = generated_server_name
+          end
+
+          return send_transaction(server_name, request)
         end
 
         def perform_confirmation(request, response)
@@ -155,14 +200,26 @@ module ActiveMerchant
           end
 
           confirm_request = GatewayConfirmation.new(request, confirm_guid)
-          confirm_request.clear_failed_server
-
-          confirm_response = send_transaction(confirm_request)
+          confirm_response = perform_targeted_transaction(confirm_request)
 
           if confirm_response.successful?
             return response
           else
             return confirm_response
+          end
+        end
+
+        def get_server_names
+          if LIVE_HOST == dns
+            host_list = Resolv.getaddresses(LIVE_HOST)
+            host_list.map do |host|
+              case host
+                when LIVE_HOST_16_IP then LIVE_HOST_16
+                when LIVE_HOST_17_IP then LIVE_HOST_17
+              end
+            end.compact
+          else
+            hosts
           end
         end
       end
